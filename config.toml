@@ -1,0 +1,11 @@
+# directory to store/prune backups
+outdir = "/backup/zones"
+
+# number of zone backups to keep
+number_of_backups = 5
+
+# prefix used in file name. Ex: zcfgbak_1662780557.zones.tar.zst
+prefix = "zcfgbak"
+
+# zstd compression level 1-21
+compression_level = 10

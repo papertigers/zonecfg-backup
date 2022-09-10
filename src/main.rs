@@ -1,11 +1,22 @@
-use std::{fs::File, io::BufRead, process::Command};
-
 use anyhow::{bail, Context};
-use slog::{o, warn, Drain, Logger};
+use chrono::Utc;
+use config::Config;
+use slog::{info, o, warn, Drain, Logger};
+use std::{
+    cmp::Reverse,
+    fs::{self, read_dir, File},
+    io::BufRead,
+    path::PathBuf,
+    process::Command,
+};
 use tar::Header;
+
+mod config;
 
 const ZONEADM: &str = "/usr/sbin/zoneadm";
 const ZONECFG: &str = "/usr/sbin/zonecfg";
+const DEFAULT_PREFIX: &str = "zonecfg-backup";
+const DEFAULT_COMPRESSION_LEVEL: i32 = 10;
 
 fn create_logger() -> Logger {
     let plain = slog_term::PlainSyncDecorator::new(std::io::stdout());
@@ -40,18 +51,25 @@ fn find_zones() -> Result<Vec<String>, anyhow::Error> {
         bail!("exec {ZONEADM}: failed {:?}", zoneadm.status);
     }
 
-    Ok(zoneadm
+    zoneadm
         .stdout
         .lines()
         .collect::<Result<Vec<String>, _>>()
-        .context("failed to parse zoneadm output")?)
+        .context("failed to parse zoneadm output")
 }
 
-fn tar_zone_info(log: Logger) -> Result<(), anyhow::Error> {
+fn backup_zone_configs(c: &Ctx) -> Result<(), anyhow::Error> {
     let zones = find_zones()?;
+    let prefix = c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX);
+    let now = Utc::now().timestamp();
+    let path = PathBuf::from(&c.config.outdir).join(format!("{prefix}_{now}.zones.tar.zst"));
     let encoder = {
-        let file = File::create("zones.tar.zst")?;
-        zstd::Encoder::new(file, 0)?
+        let file = File::create(&path).with_context(|| format!("creating {path:?}"))?;
+        let level = c
+            .config
+            .compression_level
+            .unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+        zstd::Encoder::new(file, level)?
     }
     .auto_finish();
     let mut a = tar::Builder::new(encoder);
@@ -63,20 +81,69 @@ fn tar_zone_info(log: Logger) -> Result<(), anyhow::Error> {
                 header.set_size(info.len() as u64);
                 header.set_cksum();
                 a.append_data(&mut header, format!("{zone}.zone"), info.as_slice())?;
+                info!(&c.log, "appending zone {zone}");
             }
             // perhaps the zone no longer exists, let's log an error and move on
-            Err(e) => warn!(&log, "no info for {zone}: {e:?}"),
+            Err(e) => warn!(c.log, "no info for {zone}: {e:?}"),
         }
     }
 
     a.finish()?;
+    info!(&c.log, "zone backup file written to {path:?}");
 
     Ok(())
 }
 
+fn prune_zonecfg_backups(c: &Ctx) -> Result<(), anyhow::Error> {
+    // find all entries in the directory, stopping on first error
+    let mut ents = read_dir(&c.config.outdir)
+        .with_context(|| format!("reading {:?}", c.config.outdir))?
+        .collect::<Result<Vec<_>, _>>()?;
+    // keep entries that start with our prefix
+    ents.retain(|e| {
+        e.file_name()
+            .as_os_str()
+            .to_str()
+            .map(|f| f.starts_with(&c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX)))
+            .unwrap_or(false)
+    });
+    // sort them so that we delete the oldest backups
+    ents.sort_by_key(|e| Reverse(e.file_name()));
+
+    if c.config.number_of_backups < ents.len() {
+        for to_remove in &ents[c.config.number_of_backups..] {
+            let f = to_remove.file_name();
+            fs::remove_file(&f).with_context(|| format!("removing file {f:?}"))?;
+            info!(&c.log, "pruned {f:?}")
+        }
+    }
+
+    Ok(())
+}
+
+struct Ctx {
+    config: Config,
+    log: Logger,
+}
+
 fn main() -> Result<(), anyhow::Error> {
-    let log = create_logger();
-    tar_zone_info(log)?;
+    let args: Vec<String> = std::env::args().collect();
+    if args.len() < 2 {
+        bail!("usage: {} config_file", args[0]);
+    }
+    let ctx = Ctx {
+        config: Config::from_file(&args[1])?,
+        log: create_logger(),
+    };
+
+    if let Some(level) = ctx.config.compression_level {
+        if !(1..=21).contains(&level) {
+            bail!("compression level must be between 1-21");
+        }
+    }
+
+    backup_zone_configs(&ctx)?;
+    prune_zonecfg_backups(&ctx)?;
 
     Ok(())
 }
