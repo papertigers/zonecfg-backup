@@ -1,12 +1,16 @@
 use anyhow::{bail, Context};
 use chrono::Utc;
 use config::Config;
+use sha2::{
+    digest::{generic_array::GenericArray, typenum::U32},
+    Digest, Sha256,
+};
 use slog::{info, o, warn, Drain, Logger};
 use std::{
     cmp::Reverse,
     fs::{self, read_dir, File},
-    io::BufRead,
-    path::PathBuf,
+    io::{self, BufRead, Read},
+    path::{Path, PathBuf},
     process::Command,
 };
 use tar::Header;
@@ -58,53 +62,107 @@ fn find_zones() -> Result<Vec<String>, anyhow::Error> {
         .context("failed to parse zoneadm output")
 }
 
-fn backup_zone_configs(c: &Ctx) -> Result<(), anyhow::Error> {
+fn find_latest_snapshot(c: &Ctx) -> Result<Option<PathBuf>, anyhow::Error> {
+    let prefix = c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX);
+    let latest = c.config.outdir.join(format!("{prefix}_latest"));
+    if Path::exists(&latest) {
+        return fs::read_link(&latest).map(Some).map_err(From::from);
+    }
+
+    Ok(None)
+}
+
+fn snapshot_zone_configs(c: &Ctx) -> Result<tempfile::NamedTempFile, anyhow::Error> {
     let zones = find_zones()?;
+    let tempfile = tempfile::NamedTempFile::new_in(&c.config.outdir)?;
+    let level = c
+        .config
+        .compression_level
+        .unwrap_or(DEFAULT_COMPRESSION_LEVEL);
+    let mut encoder = zstd::Encoder::new(tempfile, level)?;
+    {
+        let mut a = tar::Builder::new(&mut encoder);
+        for zone in zones {
+            match get_zonecfg(&zone) {
+                Ok(info) => {
+                    let mut header = Header::new_gnu();
+                    header.set_size(info.len() as u64);
+                    header.set_cksum();
+                    a.append_data(&mut header, format!("{zone}.zone"), info.as_slice())?;
+                    info!(&c.log, "appending zone {zone}");
+                }
+                // perhaps the zone no longer exists, let's log an error and move on
+                Err(e) => warn!(c.log, "no info for {zone}: {e:?}"),
+            }
+        }
+        a.finish()?;
+    }
+
+    encoder.finish().map_err(From::from)
+}
+
+fn generate_hash<R: Read>(mut input: R) -> Result<GenericArray<u8, U32>, anyhow::Error> {
+    let mut hasher = Sha256::new();
+    io::copy(&mut input, &mut hasher)?;
+    Ok(hasher.finalize())
+}
+
+fn try_commit_zone_snapshot(
+    c: &Ctx,
+    snapshot: tempfile::NamedTempFile,
+) -> Result<(), anyhow::Error> {
     let prefix = c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX);
     let now = Utc::now().timestamp();
     let path = PathBuf::from(&c.config.outdir).join(format!("{prefix}_{now}.zones.tar.zst"));
-    let encoder = {
-        let file = File::create(&path).with_context(|| format!("creating {path:?}"))?;
-        let level = c
-            .config
-            .compression_level
-            .unwrap_or(DEFAULT_COMPRESSION_LEVEL);
-        zstd::Encoder::new(file, level)?
-    }
-    .auto_finish();
-    let mut a = tar::Builder::new(encoder);
+    let latest_path = c.config.outdir.join(format!("{prefix}_latest"));
 
-    for zone in zones {
-        match get_zonecfg(&zone) {
-            Ok(info) => {
-                let mut header = Header::new_gnu();
-                header.set_size(info.len() as u64);
-                header.set_cksum();
-                a.append_data(&mut header, format!("{zone}.zone"), info.as_slice())?;
-                info!(&c.log, "appending zone {zone}");
-            }
-            // perhaps the zone no longer exists, let's log an error and move on
-            Err(e) => warn!(c.log, "no info for {zone}: {e:?}"),
+    if let Some(latest) = find_latest_snapshot(c)? {
+        let latest_file = File::open(&latest).with_context(|| format!("{latest:?}"))?;
+        let latest_hash = generate_hash(&latest_file)?;
+        // FIXME: why does generate_hash(snapshot.as_file()) differ from opening the file?
+        let snapshot_file = File::open(snapshot.path())?;
+        let snapshot_hash = generate_hash(snapshot_file)?;
+
+        // As I understand it, zstd is deterministic in is compression output under the following conditions:
+        // - zstd version does not change
+        // - compression level does not change
+        // If either of these conditions change in practice, the tool will simply just write a new backup file to disk.
+        if latest_hash[..] == snapshot_hash[..] {
+            info!(
+                &c.log,
+                "No changes in zone configs detected, skipping write."
+            );
+
+            return Ok(());
         }
     }
 
-    a.finish()?;
+    snapshot
+        .persist(&path)
+        .with_context(|| format!("{path:?}"))?;
     info!(&c.log, "zone backup file written to {path:?}");
+    let _ = fs::remove_file(&latest_path);
+    std::os::unix::fs::symlink(&path, &latest_path)
+        .with_context(|| format!("symlink {path:?} -> {latest_path:?}"))?;
+    info!(&c.log, "symlinked {path:?} to {latest_path:?}");
 
     Ok(())
 }
 
 fn prune_zonecfg_backups(c: &Ctx) -> Result<(), anyhow::Error> {
+    let prefix = c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX);
+    let latest = c.config.outdir.join(format!("{prefix}_latest"));
     // find all entries in the directory, stopping on first error
     let mut ents = read_dir(&c.config.outdir)
         .with_context(|| format!("reading {:?}", c.config.outdir))?
         .collect::<Result<Vec<_>, _>>()?;
     // keep entries that start with our prefix
+    let filter = |f: &str| -> bool { f.starts_with(&prefix) && f != latest.as_os_str() };
     ents.retain(|e| {
         e.file_name()
             .as_os_str()
             .to_str()
-            .map(|f| f.starts_with(&c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX)))
+            .map(filter)
             .unwrap_or(false)
     });
     // sort them so that we delete the oldest backups
@@ -142,7 +200,8 @@ fn main() -> Result<(), anyhow::Error> {
         }
     }
 
-    backup_zone_configs(&ctx)?;
+    let snapshot = snapshot_zone_configs(&ctx)?;
+    try_commit_zone_snapshot(&ctx, snapshot)?;
     prune_zonecfg_backups(&ctx)?;
 
     Ok(())
