@@ -10,19 +10,13 @@ zstd compressed tar file.
 ## Configuration
 
 [config.toml](config.toml) is provided as an example:
-```toml
-# directory to store/prune backups
-outdir = "/backup/zones"
 
-# number of zone backups to keep
-number_of_backups = 5
-
-# prefix used in file name. Ex: zcfgbak_1662780557.zones.tar.zst
-prefix = "zcfgbak"
-
-# zstd compression level 1-21
-compression_level = 10
-````
+| Option | Optional | Default | Explanation |
+| ------ | -------- | ------- | ----------- |
+| outdir | false | N/A | Directory to store/prune backups |
+| number_of_backups | false | N/A | Number of zone backups to keep |
+| prefix | true | `zonecfg-backup` | prefix used in file name `zcfgbak_1662780557.zones.tar.zst` |
+| compression_level | false | N/A | zstd compression level (1-21) |
 
 ## Example
 ```
