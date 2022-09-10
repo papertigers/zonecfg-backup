@@ -7,6 +7,12 @@ This tool will essentially loop over all configured zones,
 grab their zone config via `zonecfg -z ZONE info` and append the output to a
 zstd compressed tar file.
 
+Motivation behind this tool was to allow me to dump zone configs somewhere that
+could be picked up by a tool like rsync/zrepl. Ideally I will one day create
+zones via some other automation, but until then this saves me the hassle of
+remembering to update the templates for my zones when I make one off changes
+via something like zonecfg/zadm.
+
 ## Configuration
 
 [config.toml](config.toml) is provided as an example:
@@ -16,7 +22,7 @@ zstd compressed tar file.
 | outdir | false | N/A | Directory to store/prune backups |
 | number_of_backups | false | N/A | Number of zone backups to keep |
 | prefix | true | `zonecfg-backup` | prefix used in file name `zcfgbak_1662780557.zones.tar.zst` |
-| compression_level | false | N/A | zstd compression level (1-21) |
+| compression_level | true | 10 | zstd compression level (1-21) |
 
 ## Example
 ```
