@@ -169,12 +169,16 @@ fn try_commit_zone_snapshot(
 fn prune_zonecfg_backups(c: &Ctx) -> Result<(), anyhow::Error> {
     let prefix = file_prefix(c);
     let latest = file_latest(c);
+    let latest_file = match latest.file_name() {
+        Some(name) => name,
+        None => bail!("latest filename should be known"),
+    };
     // find all entries in the directory, stopping on first error
     let mut ents = read_dir(&c.config.outdir)
         .with_context(|| format!("reading {:?}", c.config.outdir))?
         .collect::<Result<Vec<_>, _>>()?;
     // keep entries that start with our prefix
-    let filter = |f: &str| -> bool { f.starts_with(prefix) && f != latest.as_os_str() };
+    let filter = |f: &str| -> bool { f.starts_with(prefix) && f != latest_file };
     ents.retain(|e| {
         e.file_name()
             .as_os_str()
