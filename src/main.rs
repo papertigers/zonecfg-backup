@@ -1,10 +1,7 @@
 use anyhow::{bail, Context};
 use chrono::Utc;
 use config::Config;
-use sha2::{
-    digest::{generic_array::GenericArray, typenum::U32},
-    Digest, Sha256,
-};
+use sha2::{Digest, Sha256};
 use slog::{info, o, warn, Drain, Logger};
 use std::{
     cmp::Reverse,
@@ -21,6 +18,19 @@ const ZONEADM: &str = "/usr/sbin/zoneadm";
 const ZONECFG: &str = "/usr/sbin/zonecfg";
 const DEFAULT_PREFIX: &str = "zonecfg-backup";
 const DEFAULT_COMPRESSION_LEVEL: i32 = 10;
+
+struct Ctx {
+    config: Config,
+    log: Logger,
+}
+
+fn file_prefix(c: &Ctx) -> &str {
+    c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX)
+}
+
+fn file_latest(c: &Ctx) -> PathBuf {
+    c.config.outdir.join(format!("{}_latest", file_prefix(c)))
+}
 
 fn create_logger() -> Logger {
     let plain = slog_term::PlainSyncDecorator::new(std::io::stdout());
@@ -63,8 +73,7 @@ fn find_zones() -> Result<Vec<String>, anyhow::Error> {
 }
 
 fn find_latest_snapshot(c: &Ctx) -> Result<Option<PathBuf>, anyhow::Error> {
-    let prefix = c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX);
-    let latest = c.config.outdir.join(format!("{prefix}_latest"));
+    let latest = file_latest(c);
     if Path::exists(&latest) {
         return fs::read_link(&latest).map(Some).map_err(From::from);
     }
@@ -101,17 +110,25 @@ fn snapshot_zone_configs(c: &Ctx) -> Result<tempfile::NamedTempFile, anyhow::Err
     encoder.finish().map_err(From::from)
 }
 
-fn generate_hash<R: Read>(mut input: R) -> Result<GenericArray<u8, U32>, anyhow::Error> {
+fn generate_hash<R: Read>(mut input: R) -> Result<String, anyhow::Error> {
+    use std::fmt::Write;
+
     let mut hasher = Sha256::new();
+    let mut out = String::new();
+
     io::copy(&mut input, &mut hasher)?;
-    Ok(hasher.finalize())
+    for byte in hasher.finalize().iter() {
+        let _ = write!(out, "{byte:02x}");
+    }
+
+    Ok(out)
 }
 
 fn try_commit_zone_snapshot(
     c: &Ctx,
     snapshot: tempfile::NamedTempFile,
 ) -> Result<(), anyhow::Error> {
-    let prefix = c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX);
+    let prefix = file_prefix(c);
     let now = Utc::now().timestamp();
     let path = PathBuf::from(&c.config.outdir).join(format!("{prefix}_{now}.zones.tar.zst"));
     let latest_path = c.config.outdir.join(format!("{prefix}_latest"));
@@ -127,7 +144,7 @@ fn try_commit_zone_snapshot(
         // - zstd version does not change
         // - compression level does not change
         // If either of these conditions change in practice, the tool will simply just write a new backup file to disk.
-        if latest_hash[..] == snapshot_hash[..] {
+        if latest_hash == snapshot_hash {
             info!(
                 &c.log,
                 "No changes in zone configs detected, skipping write."
@@ -150,14 +167,18 @@ fn try_commit_zone_snapshot(
 }
 
 fn prune_zonecfg_backups(c: &Ctx) -> Result<(), anyhow::Error> {
-    let prefix = c.config.prefix.as_deref().unwrap_or(DEFAULT_PREFIX);
-    let latest = c.config.outdir.join(format!("{prefix}_latest"));
+    let prefix = file_prefix(c);
+    let latest = file_latest(c);
+    let latest_file = match latest.file_name() {
+        Some(name) => name,
+        None => bail!("latest filename should be known"),
+    };
     // find all entries in the directory, stopping on first error
     let mut ents = read_dir(&c.config.outdir)
         .with_context(|| format!("reading {:?}", c.config.outdir))?
         .collect::<Result<Vec<_>, _>>()?;
     // keep entries that start with our prefix
-    let filter = |f: &str| -> bool { f.starts_with(&prefix) && f != latest.as_os_str() };
+    let filter = |f: &str| -> bool { f.starts_with(prefix) && f != latest_file };
     ents.retain(|e| {
         e.file_name()
             .as_os_str()
@@ -177,11 +198,6 @@ fn prune_zonecfg_backups(c: &Ctx) -> Result<(), anyhow::Error> {
     }
 
     Ok(())
-}
-
-struct Ctx {
-    config: Config,
-    log: Logger,
 }
 
 fn main() -> Result<(), anyhow::Error> {
