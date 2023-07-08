@@ -192,8 +192,9 @@ fn prune_zonecfg_backups(c: &Ctx) -> Result<(), anyhow::Error> {
     if c.config.number_of_backups < ents.len() {
         for to_remove in &ents[c.config.number_of_backups..] {
             let f = to_remove.file_name();
-            fs::remove_file(&f).with_context(|| format!("removing file {f:?}"))?;
-            info!(&c.log, "pruned {f:?}")
+            let path = c.config.outdir.join(f);
+            fs::remove_file(&path).with_context(|| format!("removing file {path:?}"))?;
+            info!(&c.log, "pruned {path:?}")
         }
     }
 

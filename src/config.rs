@@ -24,7 +24,7 @@ impl Config {
         let mut buf: Vec<u8> = Vec::new();
 
         br.read_to_end(&mut buf)?;
-        let config: Self = toml::from_slice(&buf)?;
+        let config: Self = toml::from_slice(&buf).context("failed to parse config file")?;
 
         Ok(config)
     }
